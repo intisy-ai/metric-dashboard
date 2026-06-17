@@ -8,7 +8,7 @@
   "author": "intisy",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/intisy/credit-dashboard.git"
+    "url": "git+https://github.com/intisy/metric-dashboard.git"
   },
   "keywords": ["opencode", "claude", "credit", "dashboard", "plugin", "billing"],
   "files": ["dist/", "README.md", "LICENSE"],
