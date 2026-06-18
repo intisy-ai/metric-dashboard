@@ -1,0 +1,23 @@
+{
+  "name": "metric-dashboard",
+  "metadata": {
+    "description": "Credit and billing dashboard plugin for OpenCode and Claude Code, with Firebase sync."
+  },
+  "owner": {
+    "name": "intisy"
+  },
+  "plugins": [
+    {
+      "name": "metric-dashboard",
+      "source": "./",
+      "description": "Credit and billing dashboard plugin for OpenCode and Claude Code, with Firebase sync.",
+      "version": "1.0.0",
+      "homepage": "https://github.com/intisy/metric-dashboard",
+      "repository": "https://github.com/intisy/metric-dashboard",
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["opencode", "claude", "credit", "dashboard", "billing", "analytics"],
+      "tags": ["productivity", "analytics"]
+    }
+  ]
+}

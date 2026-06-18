@@ -1,9 +1,64 @@
-import { tool } from "@opencode-ai/plugin";
-import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync, chmodSync, unlinkSync } from "fs";
+import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { hostname, homedir, networkInterfaces } from "os";
 import { createSign, createHash } from "crypto";
-import { Database } from "bun:sqlite";
+import { createServer } from "http";
+import { createRequire } from "module";
+import { writeLog } from "./config.js";
+
+// Bun-free runtime adapters: a single bundle serves both OpenCode (Bun runtime)
+// and the Claude Code daemon (Node runtime). SQLite prefers Node's built-in and
+// falls back to bun:sqlite; the HTTP layer uses node:http with a tiny Web-style
+// Request/Response shim so the original fetch-style handler is reused verbatim.
+const requireModule = createRequire(import.meta.url);
+
+function openSqlite(path) {
+  try {
+    const { DatabaseSync } = requireModule("node:sqlite");
+    const db = new DatabaseSync(path, { readOnly: true });
+    return { query: (sql) => db.prepare(sql), close: () => db.close() };
+  } catch {
+    try {
+      const { Database } = requireModule("bun:sqlite");
+      const db = new Database(path, { readonly: true });
+      return { query: (sql) => db.query(sql), close: () => db.close() };
+    } catch {
+      return null;
+    }
+  }
+}
+
+class WebResponse {
+  constructor(body, init) {
+    this.body = body;
+    this.status = (init && init.status) || 200;
+    this.headers = (init && init.headers) || {};
+  }
+  static json(obj, init) {
+    return new WebResponse(JSON.stringify(obj), {
+      status: (init && init.status) || 200,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+}
+const Response = WebResponse;
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(data || "{}"));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
 
 const PORT = 3456;
@@ -19,7 +74,7 @@ function findConfigDir(start) {
   }
   return dirname(start);
 }
-const CONFIG_DIR = findConfigDir(import.meta.dir);
+const CONFIG_DIR = findConfigDir(import.meta.dirname);
 const LOGS_DIR = join(CONFIG_DIR, "logs");
 const CONFIG_FOLDER = join(CONFIG_DIR, "config");
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
@@ -244,7 +299,10 @@ function openDB() {
   paths.push(DB_PATH);
   for (var p of paths) {
     if (existsSync(p)) {
-      try { return new Database(p, { readonly: true }); } catch {}
+      try {
+        var db = openSqlite(p);
+        if (db) return db;
+      } catch {}
     }
   }
   return null;
@@ -257,7 +315,7 @@ function readJSON(p) {
 function getAccountsData() {
   var allAccounts = [];
   var files = ["antigravity-accounts.json", "cursor-accounts.json", "zen-accounts.json"];
-
+  
   for (var file of files) {
     var raw = readJSON(join(CONFIG_FOLDER, file)) || readJSON(join(CONFIG_DIR, file));
     if (!raw?.accounts) continue;
@@ -293,7 +351,7 @@ function getAccountsData() {
 function buildSessionsWithCosts() {
   var db = openDB();
   var dbSessions = [];
-
+  
   if (db) {
     try {
       var sessions = db.query(
@@ -375,17 +433,18 @@ function buildSessionsWithCosts() {
           modelUsage,
           costByDay,
           messageCount: msgs.length || s.messageCount || 0,
+          source: "opencode",
         };
       });
     } catch (err) {
       try { db.close(); } catch {}
     }
   }
-
+  
   var legacySessions = [];
   var sessionDir = join(CONFIG_DIR, "data", "storage", "session");
   var msgDirBase = join(CONFIG_DIR, "data", "storage", "message");
-
+  
   if (existsSync(sessionDir)) {
     try {
       for (var projectDir of readdirSync(sessionDir)) {
@@ -395,10 +454,10 @@ function buildSessionsWithCosts() {
             if (!file.endsWith(".json")) continue;
             var s = readJSON(join(fullDir, file));
             if (!s?.id || s.parentID) continue;
-
+            
             if (dbSessions.some(ds => ds.id === s.id)) continue;
             if (legacySessions.some(ls => ls.id === s.id)) continue;
-
+            
             var msgs = [];
             var msgDir = join(msgDirBase, s.id);
             if (existsSync(msgDir)) {
@@ -410,7 +469,7 @@ function buildSessionsWithCosts() {
                 }
               } catch {}
             }
-
+            
             var totalCost = 0;
             var tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
             var modelUsage = {};
@@ -465,14 +524,96 @@ function buildSessionsWithCosts() {
               modelUsage,
               costByDay,
               messageCount: msgs.length || s.messageCount || 0,
+              source: "opencode",
             });
           }
         } catch {}
       }
     } catch {}
   }
+  
+  var ccSessions = [];
+  var ccProjectsDir = join(homedir(), ".claude", "projects");
+  if (existsSync(ccProjectsDir)) {
+    try {
+      for (var projDir of readdirSync(ccProjectsDir)) {
+        var fullProjDir = join(ccProjectsDir, projDir);
+        try {
+          for (var jf of readdirSync(fullProjDir)) {
+            if (!jf.endsWith(".jsonl")) continue;
+            var sessionId = jf.replace(".jsonl", "");
+            if (dbSessions.some(ds => ds.id === sessionId)) continue;
+            if (legacySessions.some(ls => ls.id === sessionId)) continue;
+            if (ccSessions.some(cs => cs.id === sessionId)) continue;
+            try {
+              var lines = readFileSync(join(fullProjDir, jf), "utf-8").split("\n").filter(Boolean);
+              var totalCost = 0;
+              var tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+              var modelUsage = {};
+              var costByDay = {};
+              var msgCount = 0;
+              var firstTs = 0, lastTs = 0;
+              var title = projDir.replace(/^[A-Z]--/, "").replace(/-/g, " ");
 
-  var allSessions = [...dbSessions, ...legacySessions];
+              for (var li = 0; li < lines.length; li++) {
+                try {
+                  var entry = JSON.parse(lines[li]);
+                  if (entry.type === "assistant" && entry.message && entry.message.usage) {
+                    var u = entry.message.usage;
+                    var tokIn = u.input_tokens || 0;
+                    var tokOut = u.output_tokens || 0;
+                    tokens.input += tokIn;
+                    tokens.output += tokOut;
+                    if (u.cache_read_input_tokens) tokens.cacheRead += u.cache_read_input_tokens;
+                    if (u.cache_creation_input_tokens) tokens.cacheWrite += u.cache_creation_input_tokens;
+                    msgCount++;
+
+                    var mid = entry.message.model || "unknown";
+                    if (!modelUsage[mid]) modelUsage[mid] = { cost: 0, tokens: { input: 0, output: 0, reasoning: 0 }, provider: "anthropic", count: 0 };
+                    modelUsage[mid].count += 1;
+                    modelUsage[mid].tokens.input += tokIn;
+                    modelUsage[mid].tokens.output += tokOut;
+
+                    if (entry.timestamp) {
+                      var ts = new Date(entry.timestamp).getTime();
+                      if (!firstTs || ts < firstTs) firstTs = ts;
+                      if (ts > lastTs) lastTs = ts;
+                      var md = new Date(ts);
+                      var dayKey = md.getFullYear() + "-" + (md.getMonth() + 1 < 10 ? "0" : "") + (md.getMonth() + 1) + "-" + (md.getDate() < 10 ? "0" : "") + md.getDate();
+                      if (!costByDay[dayKey]) costByDay[dayKey] = { cost: 0, tokens: 0, tokens_in: 0, tokens_out: 0, tokens_reason: 0, msgs: 0 };
+                      costByDay[dayKey].tokens += tokIn + tokOut;
+                      costByDay[dayKey].tokens_in += tokIn;
+                      costByDay[dayKey].tokens_out += tokOut;
+                      costByDay[dayKey].msgs += 1;
+                    }
+                  }
+                  if (entry.type === "queue-operation" && entry.content && !title) {
+                    title = entry.content.substring(0, 60);
+                  }
+                } catch {}
+              }
+              if (msgCount > 0) {
+                ccSessions.push({
+                  id: sessionId,
+                  title: title || "Claude Code Session",
+                  created: firstTs,
+                  updated: lastTs,
+                  cost: totalCost,
+                  tokens,
+                  modelUsage,
+                  costByDay,
+                  messageCount: msgCount,
+                  source: "claude-code",
+                });
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  var allSessions = [...dbSessions, ...legacySessions, ...ccSessions];
   allSessions.sort((a, b) => b.updated - a.updated);
   return allSessions;
 }
@@ -602,7 +743,7 @@ var HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenCode Analytics</title>
+  <title>OpenCode & Proxy Analytics</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>ðŸ“Š</text></svg>">
 <style>
 :root{--bg:#0a0f16;--bg2:#0d1117;--card:#151b23;--card2:#1a2230;--hover:#1e2a38;--border:#1e2a38;--border2:#30363d;--text:#e6edf3;--text2:#b1bac4;--dim:#8b949e;--muted:#484f58;--green:#3fb950;--green2:#238636;--yellow:#d29922;--red:#f85149;--blue:#58a6ff;--purple:#bc8cff;--cyan:#56d4dd;--r:12px;--r-sm:8px;--shadow:0 1px 3px rgba(0,0,0,.4);--shadow-lg:0 4px 12px rgba(0,0,0,.5)}
@@ -703,24 +844,26 @@ footer{text-align:center;padding:24px 0 8px;color:var(--muted);font-size:11px;bo
 .q-avail{font-size:24px;font-weight:700;margin-bottom:8px;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
 </style>
 </head>
-<body>
-<div id="app">
-<header>
-  <h1>OpenCode Analytics<small id="info"></small></h1>
-  <div class="hdr-r">
-    <span class="sync-badge n" id="sync"></span>
-    <span class="meta"><span class="dot" id="dot"></span><span id="when">Loading...</span></span>
-    <button class="btn on" id="ar" onclick="toggleAR()">Auto-refresh</button>
-    <button class="btn" onclick="load()">Refresh</button>
-  </div>
-</header>
-<div class="devices" id="devs"></div>
-<div class="summary-row" id="summary"></div>
-<div class="graph-section">
+  <body>
+  <div id="app">
+  <header>
+    <h1>OpenCode & Proxy Analytics<small id="info"></small></h1>
+    <div class="hdr-r">
+      <span class="sync-badge n" id="sync"></span>
+    </div>
+  </header>
+  <div class="devices" id="devs"></div>
+  <div class="summary-row" id="summary"></div>
+  <div class="graph-section">
   <div class="graph-hdr">
     <h2>Usage Over Time</h2>
-    <div style="display:flex;gap:8px">
-      <select id="gd" class="filter" onchange="rG();rSummary()"><option value="all">All devices</option></select>
+      <div style="display:flex;gap:8px">
+        <select id="sf" class="filter" onchange="rG();rSummary();rM();rS()">
+          <option value="all">All sources</option>
+          <option value="opencode">OpenCode</option>
+          <option value="claude-code">Claude Code</option>
+        </select>
+        <select id="gd" class="filter" onchange="rG();rSummary()"><option value="all">All devices</option></select>
       <select id="gf" class="filter" onchange="rG();rSummary()">
         <option value="7">7 Days</option>
         <option value="30">30 Days</option>
@@ -908,21 +1051,45 @@ function rQ(){
 
 function rSummary(){
   var gd=document.getElementById("gd").value;
+  var sf=document.getElementById("sf")?.value||"all";
   var days=parseInt(document.getElementById("gf").value)||9999;
   var now=Date.now();
   var cutoff=days===9999?0:now-(days*86400000);
+  
+  var ss=D.sessions||[];
+  var sCount=0;var modelSet={};
   var src={};
-  if(gd==="all"){src=D.costByDay||{}}else{
-    var devs=D.devices||[];
-    for(var di=0;di<devs.length;di++){if(devs[di].device===gd&&devs[di].costByDay){src=devs[di].costByDay;break;}}
+  
+  for(var i=0;i<ss.length;i++){
+    var s=ss[i];
+    if(gd!=="all"&&(s.onDevices||[]).indexOf(gd)===-1&&s.device!==gd)continue;
+    if(sf!=="all"&&s.source!==sf)continue;
+    
+    if(!cutoff||(s.updated&&s.updated>=cutoff)){
+      sCount++;
+      var mu=s.modelUsage||{};
+      for(var mid in mu){if(mu[mid].count>0)modelSet[mid]=true;}
+    }
+    
+    var cbd=s.costByDay||{};
+    for(var dk in cbd){
+      var parts=dk.split("-");
+      var dTs=new Date(parseInt(parts[0]),parseInt(parts[1])-1,parseInt(parts[2])).getTime();
+      if(cutoff&&dTs<cutoff)continue;
+      if(!src[dk])src[dk]={cost:0,tokens:0,tokens_in:0,tokens_out:0,tokens_reason:0,msgs:0};
+      src[dk].cost+=cbd[dk].cost||0;
+      src[dk].tokens+=cbd[dk].tokens||0;
+      src[dk].tokens_in+=cbd[dk].tokens_in||0;
+      src[dk].tokens_out+=cbd[dk].tokens_out||0;
+      src[dk].tokens_reason+=cbd[dk].tokens_reason||0;
+      src[dk].msgs+=cbd[dk].msgs||0;
+    }
   }
+
   var tC=0,tTok=0,tIn=0,tOut=0,tReason=0,tMsg=0;
   var dkeys=Object.keys(src);
   for(var di=0;di<dkeys.length;di++){
     var dk=dkeys[di];
-    var parts=dk.split("-");
-    var dTs=new Date(parseInt(parts[0]),parseInt(parts[1])-1,parseInt(parts[2])).getTime();
-    if(cutoff&&dTs<cutoff)continue;
     tC+=src[dk].cost||0;
     tTok+=src[dk].tokens||0;
     tIn+=src[dk].tokens_in||0;
@@ -930,16 +1097,7 @@ function rSummary(){
     tReason+=src[dk].tokens_reason||0;
     tMsg+=src[dk].msgs||0;
   }
-  var ss=D.sessions||[];
-  var sCount=0;var modelSet={};
-  for(var i=0;i<ss.length;i++){
-    var s=ss[i];
-    if(gd!=="all"&&(s.onDevices||[]).indexOf(gd)===-1&&s.device!==gd)continue;
-    if(cutoff&&s.updated&&s.updated<cutoff)continue;
-    sCount++;
-    var mu=s.modelUsage||{};
-    for(var mid in mu){if(mu[mid].count>0)modelSet[mid]=true;}
-  }
+  
   var mc=Object.keys(modelSet).length;
   var h='<div class="sum-card c1"><h3>Total Cost</h3><div class="val cost">'+fc(tC)+'</div><div class="sub"><span>'+tMsg+' messages</span><span>'+mc+' models</span></div></div>';
   var tokSub='<span>'+tMsg+' messages</span>';
@@ -951,15 +1109,17 @@ function rSummary(){
 
 function rM(){
   var mdVal=document.getElementById("md").value;
+  var sf=document.getElementById("sf")?.value||"all";
   var m;
-  if(mdVal==="all"){
+  if(mdVal==="all" && sf==="all"){
     m=D.models||{};
   }else{
     m={};
     var ss=D.sessions||[];
     for(var i=0;i<ss.length;i++){
       var s=ss[i];
-      if((s.onDevices||[]).indexOf(mdVal)===-1&&s.device!==mdVal)continue;
+      if(mdVal!=="all" && (s.onDevices||[]).indexOf(mdVal)===-1&&s.device!==mdVal)continue;
+      if(sf!=="all" && s.source!==sf)continue;
       var mu=s.modelUsage||{};
       var muKeys=Object.keys(mu);
       for(var j=0;j<muKeys.length;j++){
@@ -1024,8 +1184,33 @@ function rlInfo(a){var now=Date.now(),parts=[];var rl=a.rateLimits||{};
   return'<td><span class="lim-y">Yes</span><br><span style="font-size:10px;color:var(--dim)">'+parts.join(", ")+'</span></td>'}
 
 function rA(){
-  var accs=D.accounts||[],f=(document.getElementById("af").value||"").toLowerCase();
-  if(f)accs=accs.filter(function(a){return a.email.toLowerCase().indexOf(f)!==-1});
+    var accs=D.accounts||[],f=(document.getElementById("af").value||"").toLowerCase();
+    
+
+    var totalAccs = D.accounts ? D.accounts.length : 0;
+    var rateLimited = 0, coolingDown = 0, available = 0;
+    var now = Date.now();
+    for (var i=0; i<totalAccs; i++) {
+        var a = D.accounts[i];
+        var isCooling = a.coolingDownUntil && a.coolingDownUntil > now;
+        var isRateLimited = isRL(a);
+        
+        if (isRateLimited) {
+            rateLimited++;
+        } else if (isCooling) {
+            coolingDown++;
+        } else if (a.enabled) {
+            available++;
+        }
+    }
+    
+    var ph = '<div class="sum-card c1"><h3>Available Accounts</h3><div class="val cost">'+available+'</div><div class="sub"><span>Ready for usage</span></div></div>';
+    ph += '<div class="sum-card c2"><h3>Rate Limited</h3><div class="val">'+rateLimited+'</div><div class="sub"><span>Blocked by Anthropic</span></div></div>';
+    ph += '<div class="sum-card c3"><h3>Cooling Down</h3><div class="val">'+coolingDown+'</div><div class="sub"><span>Recently rotated, resting</span></div></div>';
+    var ps = document.getElementById("proxy-summary");
+    if (ps) ps.innerHTML = ph;
+
+    if(f)accs=accs.filter(function(a){return a.email.toLowerCase().indexOf(f)!==-1});
   var sk=aK.k,sd=aK.d;
   accs=accs.slice().sort(function(a,b){
     if(sk==="email")return a.email<b.email?-sd:a.email>b.email?sd:0;
@@ -1071,7 +1256,9 @@ async function toggleAllAccounts(enabled) {
 
 function rS(){
   var ss=D.sessions||[],df=document.getElementById("df").value;
+  var sf=document.getElementById("sf")?.value||"all";
   if(df!=="all")ss=ss.filter(function(s){return(s.onDevices||[]).indexOf(df)!==-1||s.device===df});
+  if(sf!=="all")ss=ss.filter(function(s){return s.source===sf});
   var sk=sK.k,sd=sK.d;
   ss=ss.slice().sort(function(a,b){
     if(sk==="title")return(a.title||"")<(b.title||"")?-sd:(a.title||"")>(b.title||"")?sd:0;
@@ -1114,6 +1301,7 @@ function stopAR(){if(ri){clearInterval(ri);ri=null}}
 
 function rG(){
   var gd=document.getElementById("gd").value;
+  var sf=document.getElementById("sf")?.value||"all";
   var days=parseInt(document.getElementById("gf").value)||9999;
   var metric=document.getElementById("gm").value;
   var now=Date.now();
@@ -1123,13 +1311,103 @@ function rG(){
   var legendEl=document.getElementById("graph-legend");
 
   var allDatesMap={};
-  var aggSrc=D.costByDay||{};
-  var aggKeys=Object.keys(aggSrc);
-  for(var i=0;i<aggKeys.length;i++){
-    var dk=aggKeys[i];var pts=dk.split("-");
-    var dTs=new Date(parseInt(pts[0]),parseInt(pts[1])-1,parseInt(pts[2])).getTime();
-    if(cutoff&&dTs<cutoff)continue;
-    allDatesMap[dk]=true;
+  var aggSrc={};
+  var devs=D.devices||[];
+  var ss=D.sessions||[];
+  
+
+  if (sf !== "all") {
+    for(var i=0;i<ss.length;i++){
+      var s=ss[i];
+      if(s.source!==sf)continue;
+      var cbd=s.costByDay||{};
+      for(var dk in cbd){
+        var pts=dk.split("-");
+        var dTs=new Date(parseInt(pts[0]),parseInt(pts[1])-1,parseInt(pts[2])).getTime();
+        if(cutoff&&dTs<cutoff)continue;
+        allDatesMap[dk]=true;
+        if(!aggSrc[dk])aggSrc[dk]={cost:0,tokens:0,tokens_in:0,tokens_out:0,tokens_reason:0,msgs:0};
+        aggSrc[dk].cost+=cbd[dk].cost||0;
+        aggSrc[dk].tokens+=cbd[dk].tokens||0;
+        aggSrc[dk].tokens_in+=cbd[dk].tokens_in||0;
+        aggSrc[dk].tokens_out+=cbd[dk].tokens_out||0;
+        aggSrc[dk].tokens_reason+=cbd[dk].tokens_reason||0;
+        aggSrc[dk].msgs+=cbd[dk].msgs||0;
+      }
+    }
+  } else {
+    aggSrc=D.costByDay||{};
+    var aggKeys=Object.keys(aggSrc);
+    for(var i=0;i<aggKeys.length;i++){
+      var dk=aggKeys[i];var pts=dk.split("-");
+      var dTs=new Date(parseInt(pts[0]),parseInt(pts[1])-1,parseInt(pts[2])).getTime();
+      if(cutoff&&dTs<cutoff)continue;
+      allDatesMap[dk]=true;
+    }
+    for(var di=0;di<devs.length;di++){
+      var dcbd=devs[di].costByDay||{};
+      var dcKeys=Object.keys(dcbd);
+      for(var ci=0;ci<dcKeys.length;ci++){
+        var dk=dcKeys[ci];var pts=dk.split("-");
+        var dTs=new Date(parseInt(pts[0]),parseInt(pts[1])-1,parseInt(pts[2])).getTime();
+        if(cutoff&&dTs<cutoff)continue;
+        allDatesMap[dk]=true;
+      }
+    }
+  }
+  var sortedDates=Object.keys(allDatesMap).sort();
+
+  if(!sortedDates.length){
+    container.innerHTML='<div class="empty-graph">No data for this period</div>';
+    if(legendEl)legendEl.innerHTML="";
+    return;
+  }
+
+  var series=[];
+  if(gd==="all"){
+    var aggData=[];
+    for(var i=0;i<sortedDates.length;i++){
+      var dk=sortedDates[i];var e=aggSrc[dk]||{};
+      aggData.push({d:dk,v:e[metric]||0});
+    }
+    series.push({name:"All Devices",data:aggData,color:"#e6edf3",thick:true});
+    if (sf === "all") {
+      for(var di=0;di<devs.length;di++){
+        var dev=devs[di];var dcbd=dev.costByDay||{};
+        var devData=[];var hasData=false;
+        for(var i=0;i<sortedDates.length;i++){
+          var dk=sortedDates[i];var e=dcbd[dk]||{};var val=e[metric]||0;
+          devData.push({d:dk,v:val});
+          if(val>0)hasData=true;
+        }
+        if(hasData)series.push({name:dd(dev.device,dev.isLocal),data:devData,color:gc(di),thick:false});
+      }
+    }
+  }else{
+    var devData=[];var dSrc={};
+    if (sf !== "all") {
+      for(var i=0;i<ss.length;i++){
+        var s=ss[i];
+        if(s.source!==sf || ((s.onDevices||[]).indexOf(gd)===-1&&s.device!==gd))continue;
+        var cbd=s.costByDay||{};
+        for(var dk in cbd) {
+          if(!dSrc[dk])dSrc[dk]={cost:0,tokens:0,tokens_in:0,tokens_out:0,tokens_reason:0,msgs:0};
+          dSrc[dk].cost+=cbd[dk].cost||0;
+          dSrc[dk].tokens+=cbd[dk].tokens||0;
+          dSrc[dk].tokens_in+=cbd[dk].tokens_in||0;
+          dSrc[dk].tokens_out+=cbd[dk].tokens_out||0;
+          dSrc[dk].tokens_reason+=cbd[dk].tokens_reason||0;
+          dSrc[dk].msgs+=cbd[dk].msgs||0;
+        }
+      }
+    } else {
+      for(var di=0;di<devs.length;di++){if(devs[di].device===gd){dSrc=devs[di].costByDay||{};break;}}
+    }
+    for(var i=0;i<sortedDates.length;i++){
+      var dk=sortedDates[i];var e=dSrc[dk]||{};
+      devData.push({d:dk,v:e[metric]||0});
+    }
+    series.push({name:dd(gd,false),data:devData,color:gc(0),thick:true});
   }
   var devs=D.devices||[];
   for(var di=0;di<devs.length;di++){
@@ -1410,193 +1688,6 @@ load();startAR();
 </body>
 </html>`;
 
-var OC_BASH = [
-  '#!/usr/bin/env bash',
-  '# oc - OpenCode project launcher (auto-installed by credit-dashboard plugin)',
-  'set -e',
-  'if [ "$1" = "remove" ]; then',
-  '  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-  '  rm -f "$SCRIPT_DIR/oc" "$SCRIPT_DIR/oc-tui.js" "$SCRIPT_DIR/oc.cmd"',
-  '  echo "oc launcher removed. Will be reinstalled on next opencode start if plugin is still active."',
-  '  exit 0',
-  'fi',
-  'if [ $# -gt 0 ]; then exec opencode "$@"; fi',
-  'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
-  'export OC_OUTPUT="${TEMP:-${TMPDIR:-/tmp}}/oc-dir-$$.txt"',
-  'bun run "$SCRIPT_DIR/oc-tui.js"',
-  'EXIT=$?',
-  'if [ $EXIT -eq 0 ] && [ -f "$OC_OUTPUT" ]; then',
-  '  DIR=$(cat "$OC_OUTPUT")',
-  '  rm -f "$OC_OUTPUT"',
-  '  if [ -n "$DIR" ]; then cd "$DIR" && exec opencode; fi',
-  'fi',
-  'rm -f "$OC_OUTPUT"',
-  'exit $EXIT',
-  ''
-].join('\n');
-
-var OC_CMD = [
-  '@echo off',
-  'if /i "%~1"=="remove" (',
-  '  del "%~dp0oc-tui.js" 2>nul',
-  '  del "%~dp0oc" 2>nul',
-  '  echo oc launcher removed. Will be reinstalled on next opencode start if plugin is still active.',
-  '  del "%~dp0oc.cmd" 2>nul & exit /b 0',
-  ')',
-  'if not "%~1"=="" (opencode %* & exit /b)',
-  'setlocal',
-  'set "SCRIPT_DIR=%~dp0"',
-  'set "OC_OUTPUT=%TEMP%\\oc-dir-%RANDOM%.txt"',
-  'call bun run "%SCRIPT_DIR%oc-tui.js" %*',
-  'if errorlevel 1 (',
-  '  del "%OC_OUTPUT%" 2>nul',
-  '  exit /b 1',
-  ')',
-  'if not exist "%OC_OUTPUT%" exit /b 1',
-  'set /p OCDIR=<"%OC_OUTPUT%"',
-  'del "%OC_OUTPUT%" 2>nul',
-  'if not defined OCDIR exit /b 1',
-  'endlocal & cd /d "%OCDIR%" & opencode',
-  ''
-].join('\r\n');
-
-var PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"';
-var PATH_MARKER = "# oc-launcher PATH";
-
-async function installOcLauncher() {
-  var home = homedir();
-  var binDir = join(home, ".local", "bin");
-  var tuiSrc = join(import.meta.dir, "..", "oc-tui.js");
-  var tuiDst = join(binDir, "oc-tui.js");
-  var bashPath = join(binDir, "oc");
-  var isWin = process.platform === "win32";
-
-  if (!existsSync(binDir)) mkdirSync(binDir, { recursive: true });
-
-  if (existsSync(tuiSrc)) {
-    writeFileSync(tuiDst, readFileSync(tuiSrc));
-  }
-
-  writeFileSync(bashPath, OC_BASH, { mode: 0o755 });
-  try { chmodSync(bashPath, 0o755); } catch {}
-
-  if (isWin) {
-    var cmdPath = join(binDir, "oc.cmd");
-    writeFileSync(cmdPath, OC_CMD);
-  }
-
-  var oldQuery = join(binDir, "oc-query.js");
-  try { if (existsSync(oldQuery)) { var fs = require("fs"); fs.unlinkSync(oldQuery); } } catch {}
-
-  if (!isWin) {
-    var rcCandidates = [
-      join(home, ".bashrc"),
-      join(home, ".bash_profile"),
-      join(home, ".profile"),
-    ];
-    var zshrc = join(home, ".zshrc");
-    var zprofile = join(home, ".zprofile");
-    if (process.platform === "darwin") {
-      rcCandidates.push(zprofile);
-      rcCandidates.push(zshrc);
-    } else {
-      if (existsSync(zshrc)) rcCandidates.push(zshrc);
-      if (existsSync(zprofile)) rcCandidates.push(zprofile);
-    }
-    for (var rcFile of rcCandidates) {
-      var content = "";
-      if (existsSync(rcFile)) {
-        content = readFileSync(rcFile, "utf-8");
-        if (content.includes(".local/bin")) continue;
-      } else {
-        if (rcFile === zshrc || rcFile === zprofile) {
-          if (process.platform !== "darwin") continue;
-        } else {
-          continue;
-        }
-      }
-      var addition = "\n" + PATH_MARKER + "\n" + PATH_LINE + "\n";
-      writeFileSync(rcFile, content + addition, "utf-8");
-    }
-  }
-
-  if (isWin) {
-    var winBinDir = join(home, ".local", "bin");
-    var runtimePath = process.env.PATH || process.env.Path || "";
-    if (!runtimePath.includes(winBinDir)) {
-      try {
-        var getProc = Bun.spawn(["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path', 'User')"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-        var currentPath = (await new Response(getProc.stdout).text()).trim();
-        await getProc.exited;
-        if (currentPath && !currentPath.includes(winBinDir)) {
-          var newPath = winBinDir + ";" + currentPath;
-          var setProc = Bun.spawn(["powershell", "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path', '" + newPath.replace(/'/g, "''") + "', 'User')"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-          await setProc.exited;
-        }
-      } catch {}
-    }
-  }
-}
-
-async function uninstallOcLauncher() {
-  var home = homedir();
-  var binDir = join(home, ".local", "bin");
-  var isWin = process.platform === "win32";
-  var removed = [];
-
-  var files = ["oc", "oc-tui.js"];
-  if (isWin) files.push("oc.cmd");
-  for (var f of files) {
-    var p = join(binDir, f);
-    try { if (existsSync(p)) { unlinkSync(p); removed.push(p); } } catch {}
-  }
-
-  var rcFiles = [
-    join(home, ".bashrc"),
-    join(home, ".bash_profile"),
-    join(home, ".profile"),
-    join(home, ".zshrc"),
-    join(home, ".zprofile"),
-  ];
-  for (var rcFile of rcFiles) {
-    if (!existsSync(rcFile)) continue;
-    try {
-      var content = readFileSync(rcFile, "utf-8");
-      if (!content.includes(PATH_MARKER)) continue;
-      var lines = content.split("\n");
-      var out = [];
-      var skip = false;
-      for (var i = 0; i < lines.length; i++) {
-        if (lines[i].trim() === PATH_MARKER) { skip = true; continue; }
-        if (skip && lines[i].trim() === PATH_LINE) { skip = false; continue; }
-        skip = false;
-        out.push(lines[i]);
-      }
-      var cleaned = out.join("\n").replace(/\n{3,}$/g, "\n\n");
-      writeFileSync(rcFile, cleaned, "utf-8");
-      removed.push(rcFile + " (PATH entry)");
-    } catch {}
-  }
-
-  if (isWin) {
-    try {
-      var winBinDir = join(home, ".local", "bin");
-      var getProc = Bun.spawn(["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path', 'User')"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-      var currentPath = (await new Response(getProc.stdout).text()).trim();
-      await getProc.exited;
-      if (currentPath && currentPath.includes(winBinDir)) {
-        var parts = currentPath.split(";").filter(function(p) { return p !== winBinDir; });
-        var newPath = parts.join(";");
-        var setProc = Bun.spawn(["powershell", "-NoProfile", "-Command", "[Environment]::SetEnvironmentVariable('Path', '" + newPath.replace(/'/g, "''") + "', 'User')"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-        await setProc.exited;
-        removed.push("Windows PATH entry");
-      }
-    } catch {}
-  }
-
-  return removed;
-}
-
 async function isPortTaken() {
   try {
     var res = await fetch("http://127.0.0.1:" + PORT + "/", { signal: AbortSignal.timeout(500) });
@@ -1606,8 +1697,6 @@ async function isPortTaken() {
 
 async function startBackground() {
   fbConnected = !!loadServiceAccount();
-
-  installOcLauncher().catch(function() {});
 
   await tryClaimServer();
 
@@ -1627,10 +1716,7 @@ async function tryClaimServer() {
   var taken = await isPortTaken();
   if (!taken) {
     try {
-      Bun.serve({
-        port: PORT,
-        hostname: "127.0.0.1",
-        async fetch(req) {
+      var handleFetch = async function (req) {
           var url = new URL(req.url);
           if (url.pathname === "/" || url.pathname === "") {
             return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -1643,6 +1729,66 @@ async function tryClaimServer() {
             merged.firebaseConnected = fbConnected;
             merged.nicknames = await getNicknames();
             return Response.json(merged);
+          }
+          if (url.pathname === "/api/accounts" && req.method === "GET") {
+
+            try {
+              var accFile = join(CONFIG_FOLDER, "antigravity-accounts.json");
+              if (!existsSync(accFile)) accFile = join(CONFIG_DIR, "antigravity-accounts.json");
+              if (existsSync(accFile)) {
+                var accData = JSON.parse(readFileSync(accFile, "utf-8"));
+                return Response.json({ accounts: accData.accounts || [] });
+              }
+              return Response.json({ accounts: [] });
+            } catch { return Response.json({ accounts: [] }); }
+          }
+          if (url.pathname === "/api/accounts" && req.method === "POST") {
+
+            try {
+              var body = await req.json();
+              var incoming = body.accounts || [];
+              if (!incoming.length) return Response.json({ ok: false, error: "No accounts" }, { status: 400 });
+
+
+              var accFile = join(CONFIG_FOLDER, "antigravity-accounts.json");
+              if (!existsSync(accFile)) accFile = join(CONFIG_DIR, "antigravity-accounts.json");
+              var existing = [];
+              var fileData = { version: 4, accounts: [], activeIndex: 0, activeIndexByFamily: {} };
+              if (existsSync(accFile)) {
+                try {
+                  fileData = JSON.parse(readFileSync(accFile, "utf-8"));
+                  existing = fileData.accounts || [];
+                } catch {}
+              }
+
+
+              var seen = new Set();
+              var merged = [];
+              for (var a of incoming) {
+                var k = a.email || a.refreshToken;
+                if (!k || seen.has(k)) continue;
+                seen.add(k);
+                merged.push(a);
+              }
+              for (var a of existing) {
+                var k = a.email || a.refreshToken;
+                if (!k || seen.has(k)) continue;
+                seen.add(k);
+                merged.push(a);
+              }
+
+              fileData.accounts = merged;
+              fileData.version = 4;
+
+              var outFile = join(CONFIG_FOLDER, "antigravity-accounts.json");
+              if (!existsSync(CONFIG_FOLDER)) mkdirSync(CONFIG_FOLDER, { recursive: true });
+              writeFileSync(outFile, JSON.stringify(fileData, null, 2), "utf-8");
+
+              var legacyFile = join(CONFIG_DIR, "antigravity-accounts.json");
+              try { writeFileSync(legacyFile, JSON.stringify(fileData, null, 2), "utf-8"); } catch {}
+
+              return Response.json({ ok: true, count: merged.length });
+            } catch (e) { return Response.json({ ok: false, error: String(e) }, { status: 500 }); }
           }
           if (url.pathname === "/api/nickname" && req.method === "POST") {
             try {
@@ -1719,19 +1865,45 @@ async function tryClaimServer() {
             } catch { return Response.json({ ok: false }, { status: 400 }); }
           }
           return new Response("Not found", { status: 404 });
-        },
+      };
+      var srv = createServer(function (nreq, nres) {
+        var wreq = {
+          url: "http://127.0.0.1:" + PORT + nreq.url,
+          method: nreq.method,
+          json: function () { return readJsonBody(nreq); },
+        };
+        handleFetch(wreq)
+          .then(function (r) {
+            nres.writeHead(r.status || 200, r.headers || {});
+            nres.end(r.body == null ? "" : r.body);
+          })
+          .catch(function () {
+            nres.writeHead(500, { "Content-Type": "text/plain" });
+            nres.end("Internal error");
+          });
       });
-      ownsServer = true;
+      srv.on("error", function (err) {
+        var msg = String((err && (err.message || err.code)) || err);
+        if (!msg.includes("EADDRINUSE") && !msg.includes("address already in use")) {
+          writeLog("dashboard server error: " + msg, true);
+        }
+      });
+      srv.listen(PORT, "127.0.0.1", function () {
+        ownsServer = true;
+        writeLog("dashboard server listening on http://127.0.0.1:" + PORT);
+      });
     } catch (err) {
-      var msg = String(err?.message || err?.code || err);
-      if (!msg.includes("EADDRINUSE") && !msg.includes("address already in use")) {
-      }
+      writeLog("tryClaimServer failed: " + String((err && err.message) || err), true);
     }
   }
 }
 
 const creditDashboardPlugin = async (ctx) => {
   setTimeout(startBackground, 0);
+
+  // `tool` is loaded lazily so the Node-runtime Claude daemon (which never
+  // builds this return value) does not need @opencode-ai/plugin installed.
+  const { tool } = await import("@opencode-ai/plugin");
 
   return {
     tool: {
@@ -1742,18 +1914,18 @@ const creditDashboardPlugin = async (ctx) => {
           return "Credit usage dashboard: http://127.0.0.1:" + PORT;
         },
       }),
-      oc_remove: tool({
-        description: "Remove the oc launcher command. Deletes oc, oc.cmd, oc-tui.js from ~/.local/bin and removes PATH entries from shell rc files. The launcher will be reinstalled on next opencode start if the plugin is still active.",
-        args: {},
-        async execute() {
-          var removed = await uninstallOcLauncher();
-          if (!removed.length) return "Nothing to remove â€” oc launcher was not installed.";
-          return "Removed oc launcher:\\n" + removed.join("\\n") + "\\n\\nNote: will be reinstalled on next opencode start if credit-dashboard plugin is still active.";
-        },
-      }),
     },
   };
 };
+
+// Claude Code runs this bundle as a standalone daemon (claudeHub.daemon, Node
+// runtime) with no plugin context, detected via the ".claude" path in argv —
+// start the background server directly. OpenCode loads it in-process (Bun) and
+// the exported plugin's ctx triggers startBackground instead.
+const isClaude = process.argv.join(" ").includes("claude");
+if (isClaude) {
+  startBackground();
+}
 
 export const server = creditDashboardPlugin;
 export default creditDashboardPlugin;
