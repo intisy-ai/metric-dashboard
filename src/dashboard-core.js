@@ -5,6 +5,8 @@ import { createSign, createHash } from "crypto";
 import { createServer } from "http";
 import { createRequire } from "module";
 import { writeLog } from "./config.js";
+import { deployCommands } from "../core/src/index.js";
+import { METRIC_COMMANDS, maybeRunCli } from "./commands.js";
 
 // Bun-free runtime adapters: a single bundle serves both OpenCode (Bun runtime)
 // and the Claude Code daemon (Node runtime). SQLite prefers Node's built-in and
@@ -1921,6 +1923,18 @@ const creditDashboardPlugin = async (ctx) => {
 // runtime) with no plugin context, detected via the ".claude" path in argv —
 // start the background server directly. OpenCode loads it in-process (Bun) and
 // the exported plugin's ctx triggers startBackground instead.
+// Slash-command / config invocations shell back in as `node <bundle> <action>`;
+// run the action and exit before starting the daemon. On a normal load, keep the
+// cross-app commands deployed (idempotent, best-effort).
+if (await maybeRunCli("metric-dashboard")) {
+  process.exit(0);
+}
+try {
+  deployCommands("metric-dashboard", METRIC_COMMANDS);
+} catch {
+  /* best-effort */
+}
+
 const isClaude = process.argv.join(" ").includes("claude");
 if (isClaude) {
   startBackground();
