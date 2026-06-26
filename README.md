@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/metric-dashboard)](https://www.npmjs.com/package/metric-dashboard)
 [![npm downloads](https://img.shields.io/npm/dm/metric-dashboard)](https://www.npmjs.com/package/metric-dashboard)
-[![CI](https://github.com/intisy/metric-dashboard/actions/workflows/publish.yml/badge.svg)](https://github.com/intisy/metric-dashboard/actions/workflows/publish.yml)
+[![CI](https://github.com/intisy-ai/metric-dashboard/actions/workflows/publish.yml/badge.svg)](https://github.com/intisy-ai/metric-dashboard/actions/workflows/publish.yml)
 
 Credit and billing dashboard for OpenCode and Claude Code from a single codebase. It aggregates session costs, token usage, model breakdowns, and account quotas across both apps, serves a local web UI, and optionally syncs a snapshot across your devices via Firebase.
 
@@ -47,7 +47,7 @@ flowchart TD
 ### Via plugin-updater (recommended)
 Add to `~/.config/opencode/config/plugins.json`:
 ```json
-[{ "name": "metric-dashboard", "url": "https://github.com/intisy/metric-dashboard", "enabled": true }]
+[{ "name": "metric-dashboard", "url": "https://github.com/intisy-ai/metric-dashboard", "enabled": true }]
 ```
 
 ### Via npm
