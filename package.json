@@ -1,6 +1,6 @@
 {
   "name": "metric-dashboard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Credit and billing dashboard plugin for OpenCode and Claude Code, with Firebase sync.",
   "main": "dist/index.js",
   "type": "module",
