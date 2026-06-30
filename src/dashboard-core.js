@@ -89,6 +89,9 @@ const REMOTE_CACHE_TTL_CFG = (typeof _pluginCfg.remote_cache_ttl_ms === "number"
 const DB_PATH = (typeof _pluginCfg.db_path === "string" && _pluginCfg.db_path.trim() !== "")
   ? _pluginCfg.db_path.trim()
   : join(homedir(), ".local", "share", "opencode", "opencode.db");
+const PLUGIN_ENABLED = _pluginCfg.enabled !== false;
+const HOST = (typeof _pluginCfg.host === "string") ? _pluginCfg.host : "";
+const SYNC_ENABLED = _pluginCfg.sync_enabled !== false;
 const FIREBASE_SCOPE = "https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email";
 
 function getMacAddress() {
@@ -1709,12 +1712,16 @@ async function startBackground() {
 
   await tryClaimServer();
 
-  try { await pushToFirebase(getCachedSnapshot()); } catch {}
-
-  setInterval(async () => {
+  if (SYNC_ENABLED) {
     try { await pushToFirebase(getCachedSnapshot()); } catch {}
-    if (!ownsServer) { await tryClaimServer(); }
-  }, SYNC_INTERVAL_MS);
+  }
+
+  if (SYNC_ENABLED) {
+    setInterval(async () => {
+      try { await pushToFirebase(getCachedSnapshot()); } catch {}
+      if (!ownsServer) { await tryClaimServer(); }
+    }, SYNC_INTERVAL_MS);
+  }
 
   setInterval(async () => {
     if (!ownsServer) { await tryClaimServer(); }
@@ -1897,9 +1904,9 @@ async function tryClaimServer() {
           writeLog("dashboard server error: " + msg, true);
         }
       });
-      srv.listen(PORT, "127.0.0.1", function () {
+      srv.listen(PORT, HOST || undefined, function () {
         ownsServer = true;
-        writeLog("dashboard server listening on http://127.0.0.1:" + PORT);
+        writeLog("dashboard server listening on http://" + (HOST || "0.0.0.0") + ":" + PORT);
       });
     } catch (err) {
       writeLog("tryClaimServer failed: " + String((err && err.message) || err), true);
@@ -1908,7 +1915,7 @@ async function tryClaimServer() {
 }
 
 const creditDashboardPlugin = async (ctx) => {
-  setTimeout(startBackground, 0);
+  if (PLUGIN_ENABLED) setTimeout(startBackground, 0);
 
   // Return the raw tool object (no @opencode-ai/plugin import): a dynamic import
   // of the SDK throws from the deployed plugin location → opencode would store an
@@ -1943,7 +1950,7 @@ try {
 }
 
 const isClaude = process.argv.join(" ").includes("claude");
-if (isClaude) {
+if (isClaude && PLUGIN_ENABLED) {
   startBackground();
 }
 

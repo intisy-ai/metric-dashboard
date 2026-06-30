@@ -13,6 +13,9 @@ defineConfig(PACKAGE_NAME, {
   snapshot_ttl_ms: 5000,
   remote_cache_ttl_ms: 15000,
   db_path: "",
+  enabled: true,
+  host: "",
+  sync_enabled: true,
 });
 
 export { getAppConfigDir };
