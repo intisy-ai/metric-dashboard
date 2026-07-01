@@ -8,4 +8,5 @@ runPluginContract({
   app: "both",
   commands: ["credits", "metric-dashboard-config"],
   deploy: "load",
+  readme: true,
 });

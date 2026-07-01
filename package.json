@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
+    "postbuild": "node dist/index.js readme",
     "test": "npm run build && vitest run",
     "prepublishOnly": "npm run build"
   },
